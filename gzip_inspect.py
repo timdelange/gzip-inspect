@@ -5,7 +5,7 @@ validate the header magic, attempt to decompress, and report on the
 trailer (CRC32 + size) to diagnose malformed gzip responses.
 
 Usage:
-  gzip_inspect.py <url> [-o raw_response.gz]
+  gzip_inspect.py <url> [-H "Header: value"] [-o raw_response.gz]
 """
 import sys
 import gzip
@@ -21,7 +21,107 @@ GZIP_MAGIC = b"\x1f\x8b"
 TRAILER_LEN = 8
 
 
-def fetch_raw(url: str, timeout: int = 30) -> bytes:
+def parse_http_headers(header_block: bytes) -> dict[str, str]:
+    """Parse an HTTP response header block into lowercase name -> value."""
+    lines = header_block.decode("latin-1").split("\r\n")
+    headers: dict[str, str] = {}
+    for line in lines[1:]:
+        if not line or ":" not in line:
+            continue
+        name, value = line.split(":", 1)
+        key = name.strip().lower()
+        val = value.strip()
+        if key in headers:
+            headers[key] += ", " + val
+        else:
+            headers[key] = val
+    return headers
+
+
+def is_chunked(headers: dict[str, str]) -> bool:
+    te = headers.get("transfer-encoding", "")
+    return "chunked" in (part.strip().lower() for part in te.split(","))
+
+
+def decode_chunked(data: bytes) -> bytes:
+    """Decode an HTTP/1.1 chunked transfer-encoded body."""
+    pos = 0
+    out = bytearray()
+    while True:
+        crlf = data.find(b"\r\n", pos)
+        if crlf == -1:
+            raise RuntimeError("malformed chunked body: missing chunk-size line")
+        size_line = data[pos:crlf]
+        size_part = size_line.split(b";", 1)[0].strip()
+        try:
+            chunk_size = int(size_part, 16)
+        except ValueError as e:
+            raise RuntimeError(
+                f"malformed chunked body: invalid chunk size {size_part!r}"
+            ) from e
+
+        pos = crlf + 2
+        if chunk_size == 0:
+            if data.startswith(b"\r\n", pos):
+                return bytes(out)
+            trailer_end = data.find(b"\r\n\r\n", pos)
+            if trailer_end == -1:
+                raise RuntimeError(
+                    "malformed chunked body: missing terminator after final chunk"
+                )
+            return bytes(out)
+
+        end = pos + chunk_size
+        if len(data) < end + 2:
+            raise RuntimeError("malformed chunked body: truncated chunk data")
+        out.extend(data[pos:end])
+        if data[end : end + 2] != b"\r\n":
+            raise RuntimeError("malformed chunked body: missing chunk data terminator")
+        pos = end + 2
+
+
+def extract_body(raw: bytes) -> bytes:
+    """Split HTTP headers from body and decode transfer encodings."""
+    sep = b"\r\n\r\n"
+    if sep not in raw:
+        raise RuntimeError("malformed HTTP response: no header/body separator")
+    header_block, body = raw.split(sep, 1)
+    headers = parse_http_headers(header_block)
+
+    if is_chunked(headers):
+        return decode_chunked(body)
+
+    content_length = headers.get("content-length")
+    if content_length is not None:
+        try:
+            length = int(content_length.strip())
+        except ValueError as e:
+            raise RuntimeError(
+                f"malformed HTTP response: invalid Content-Length {content_length!r}"
+            ) from e
+        if len(body) < length:
+            raise RuntimeError(
+                "malformed HTTP response: body shorter than Content-Length "
+                f"({len(body)} < {length})"
+            )
+        return body[:length]
+
+    return body
+
+
+def parse_header_arg(header: str) -> str:
+    """Validate a curl-style 'Name: value' header string."""
+    if ":" not in header:
+        raise ValueError(f"invalid header (expected 'Name: value'): {header!r}")
+    name, value = header.split(":", 1)
+    name = name.strip()
+    value = value.strip()
+    if not name:
+        raise ValueError(f"invalid header (empty name): {header!r}")
+    return f"{name}: {value}"
+
+
+def fetch_raw(url: str, extra_headers: list[str] | None = None, timeout: int = 30) -> bytes:
     """Fetch URL with no automatic gzip decoding — return the raw bytes."""
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
@@ -41,6 +141,8 @@ def fetch_raw(url: str, timeout: int = 30) -> bytes:
         "Accept-Encoding: gzip",  # request gzip so server actually sends it
         "Connection: close",
     ]
+    if extra_headers:
+        headers.extend(extra_headers)
     request = ("\r\n".join(headers) + "\r\n\r\n").encode("ascii")
 
     raw = b""
@@ -58,14 +160,11 @@ def fetch_raw(url: str, timeout: int = 30) -> bytes:
     except (socket.timeout, socket.gaierror, ConnectionRefusedError, OSError) as e:
         raise RuntimeError(f"network error fetching {url}: {e}") from e
 
-    # Split HTTP headers from body on the empty line (CRLF CRLF).
-    sep = b"\r\n\r\n"
-    if sep not in raw:
-        raise RuntimeError("malformed HTTP response: no header/body separator")
-    _, body = raw.split(sep, 1)
-    # Some servers send chunked transfer-encoding with Content-Length too;
-    # for a simple inspector we trust the server terminated the connection.
-    return body
+    # Split headers from body and decode chunked transfer-encoding when present.
+    try:
+        return extract_body(raw)
+    except RuntimeError as e:
+        raise RuntimeError(f"malformed HTTP response fetching {url}: {e}") from e
 
 
 def inspect(body: bytes) -> dict:
@@ -117,12 +216,28 @@ def inspect(body: bytes) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("url", help="HTTP(S) URL to fetch")
+    ap.add_argument(
+        "-H",
+        "--header",
+        action="append",
+        dest="headers",
+        metavar="HEADER",
+        help='extra HTTP header, curl-style (e.g. -H "Authorization: Bearer token")',
+    )
     ap.add_argument("-o", "--output", help="write raw body to this file")
     args = ap.parse_args()
 
+    extra_headers: list[str] = []
+    if args.headers:
+        try:
+            extra_headers = [parse_header_arg(h) for h in args.headers]
+        except ValueError as e:
+            print(f"HEADER ERROR: {e}", file=sys.stderr)
+            return 2
+
     print(f"Fetching {args.url} (Accept-Encoding: gzip) ...")
     try:
-        body = fetch_raw(args.url)
+        body = fetch_raw(args.url, extra_headers=extra_headers or None)
     except RuntimeError as e:
         print(f"NETWORK ERROR: {e}", file=sys.stderr)
         return 2
